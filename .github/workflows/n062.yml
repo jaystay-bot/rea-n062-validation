@@ -1,0 +1,73 @@
+# One-time static validation of rea-agents 6.7.0 against a public CC0 sample. Manual trigger only.
+# No secrets, no token permissions, no checkout, no artifacts (all evidence goes to the job log).
+name: n062-rea-validation
+on:
+  workflow_dispatch:
+permissions: {}
+concurrency:
+  group: n062-rea-validation
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    permissions: {}
+    timeout-minutes: 15
+    env:
+      REA_VERSION: "6.7.0"
+      REA_SHA512: "sha512-yhIx2ioJYYT1C/tONfYeitC6LhnKmCh+ZwRUOgYuhSc733lGhkkt73zhug9WmLgxoMdKuqIYGCoBfD4fXkOhFw=="
+      PKG_JSON_SHA256: "bc339bdd8a398b0f9cf48d96280afbb0fa65a5bb25e46474480b8a3d0c4e3402"
+      LOCK_SHA256: "14d434a4ac72023d437ae42442436b6ab4141ccb66444c44fb38e8df6689f1b8"
+      SAMPLE_REPO: "https://github.com/electron/electron-quick-start-typescript.git"
+      SAMPLE_SHA: "eb58abdbd1dd8cb0d2df9608fccf12ad989a189b"
+      npm_config_ignore_scripts: "true"
+      npm_config_omit: "optional"
+      npm_config_audit: "false"
+      npm_config_fund: "false"
+    steps:
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "24.19.0"
+      - name: Fetch pinned inputs from this commit and verify hashes
+        run: |
+          set -euo pipefail
+          mkdir -p tool
+          for f in package.json package-lock.json; do
+            curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/$f" -o "tool/$f"
+          done
+          echo "${PKG_JSON_SHA256}  tool/package.json" | sha256sum -c -
+          echo "${LOCK_SHA256}  tool/package-lock.json" | sha256sum -c -
+      - name: Verify package integrity and install without scripts or optional deps
+        run: |
+          set -euo pipefail
+          cd tool
+          npm pack "rea-agents@${REA_VERSION}" --ignore-scripts --json > pack.json
+          node -e "const p=require('./pack.json')[0]; if(p.integrity!==process.env.REA_SHA512){console.error('INTEGRITY MISMATCH',p.integrity);process.exit(1)} console.log('INTEGRITY OK',p.integrity)"
+          sha256sum rea-agents-*.tgz
+          npm ci --ignore-scripts --omit=optional
+          npm audit signatures
+          if [ -d node_modules/frida ]; then echo "frida present: abort"; exit 1; fi
+          echo "== native modules"; find node_modules -name '*.node' -exec sha256sum {} +
+      - name: Fetch pinned public sample (no install, no execution)
+        run: |
+          set -euo pipefail
+          git init -q sample && cd sample
+          git fetch -q --depth 1 "$SAMPLE_REPO" "$SAMPLE_SHA"
+          git -c advice.detachedHead=false checkout -q FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$SAMPLE_SHA" && echo "SAMPLE SHA OK $SAMPLE_SHA"
+          echo "== sample files"; git ls-files
+      - name: Run REA static JavaScript/Electron inspection only
+        run: |
+          set -uo pipefail
+          export HOME="$RUNNER_TEMP/rea-home"; mkdir -p "$HOME"
+          start=$(date +%s)
+          /usr/bin/time -v -o time.txt ./tool/node_modules/.bin/rea analyze-javascript-application "$GITHUB_WORKSPACE/sample" --json > rea-result.json 2> rea-stderr.txt
+          code=$?
+          echo "REA_EXIT=$code WALL_SECONDS=$(( $(date +%s) - start ))"
+          echo "== resource usage"; cat time.txt
+          echo "== stderr (first 200 lines)"; head -n 200 rea-stderr.txt
+          echo "== result size"; wc -c rea-result.json; sha256sum rea-result.json
+          echo "== REA JSON RESULT BEGIN"; cat rea-result.json; echo; echo "== REA JSON RESULT END"
+          echo "== files written under HOME"; find "$HOME" -type f | head -n 50
+          echo "== sample modified (should be empty)"; git -C sample status --porcelain
+          exit $code
